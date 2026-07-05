@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as futures
+from dataclasses import dataclass
 import glob
 import hashlib
 import io
@@ -90,14 +91,129 @@ def dedupe_ports(paths: Iterable[str]) -> list[str]:
     return sorted(best_by_real.values(), key=natural_key)
 
 
-def discover_ports() -> list[str]:
+@dataclass(frozen=True)
+class PortInfo:
+    device: str
+    description: str = ""
+    hwid: str = ""
+    vid: int | None = None
+    pid: int | None = None
+    likely_esp32s3: bool = False
+    reason: str = ""
+
+
+# Espressif native USB/JTAG and the USB-UART bridges most commonly found on
+# ESP32-S3 dev boards.  Bridge chips are marked “疑似” because they identify the
+# USB-serial adapter, not the MCU behind it.
+ESPRESSIF_VIDS = {0x303A}
+COMMON_ESP_USB_SERIAL_VIDS = {0x10C4, 0x1A86, 0x0403, 0x2E8A}
+ESP_TEXT_HINTS = (
+    "esp32",
+    "esp32-s3",
+    "esp32s3",
+    "espressif",
+    "usb jtag/serial",
+    "usb-jtag",
+    "cp210",
+    "silicon labs",
+    "ch340",
+    "wch",
+    "ft232",
+    "ftdi",
+)
+LAST_PORT_INFO: dict[str, PortInfo] = {}
+
+
+def _score_port_info(device: str, description: str = "", hwid: str = "", vid: int | None = None, pid: int | None = None) -> PortInfo:
+    text = f"{device} {description} {hwid}".lower()
+    likely = False
+    reasons: list[str] = []
+    if vid in ESPRESSIF_VIDS:
+        likely = True
+        reasons.append("Espressif USB")
+    elif vid in COMMON_ESP_USB_SERIAL_VIDS:
+        likely = True
+        reasons.append("常见 ESP32 USB-Serial 芯片")
+    for hint in ESP_TEXT_HINTS:
+        if hint in text:
+            likely = True
+            reasons.append(hint)
+            break
+    return PortInfo(device=device, description=description, hwid=hwid, vid=vid, pid=pid, likely_esp32s3=likely, reason=" / ".join(dict.fromkeys(reasons)))
+
+
+def _pyserial_port_infos() -> list[PortInfo]:
+    try:
+        from serial.tools import list_ports  # type: ignore
+    except Exception:
+        return []
+    out: list[PortInfo] = []
+    for item in list_ports.comports():
+        out.append(_score_port_info(
+            getattr(item, "device", "") or "",
+            getattr(item, "description", "") or "",
+            getattr(item, "hwid", "") or "",
+            getattr(item, "vid", None),
+            getattr(item, "pid", None),
+        ))
+    return [p for p in out if p.device]
+
+
+def _windows_wmi_port_infos() -> list[PortInfo]:
+    """Fallback when pyserial is unavailable: ask Windows PnP for COM devices."""
+    if platform.system().lower() != "windows":
+        return []
+    try:
+        cmd = [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "Get-CimInstance Win32_PnPEntity | Where-Object { $_.Name -match '\(COM[0-9]+\)' } | ForEach-Object { $_.Name + '|' + $_.PNPDeviceID }",
+        ]
+        r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=6)
+    except Exception:
+        return []
+    if r.returncode != 0:
+        return []
+    import re
+    out: list[PortInfo] = []
+    for line in r.stdout.splitlines():
+        if "|" not in line:
+            continue
+        name, hwid = line.split("|", 1)
+        m = re.search(r"\((COM\d+)\)", name, re.I)
+        if not m:
+            continue
+        vid = pid = None
+        vm = re.search(r"VID_([0-9A-F]{4})", hwid, re.I)
+        pm = re.search(r"PID_([0-9A-F]{4})", hwid, re.I)
+        if vm:
+            vid = int(vm.group(1), 16)
+        if pm:
+            pid = int(pm.group(1), 16)
+        out.append(_score_port_info(m.group(1).upper(), name, hwid, vid, pid))
+    return out
+
+
+def discover_port_infos(include_all_windows_com: bool = False) -> list[PortInfo]:
     system = platform.system().lower()
-    candidates: list[str] = []
     if system == "windows":
-        # 不依赖 pyserial 的最低限度 COM 扫描。
-        for i in range(1, 257):
-            candidates.append(f"COM{i}")
-        return candidates
+        infos = _pyserial_port_infos() or _windows_wmi_port_infos()
+        if infos:
+            selected = infos if include_all_windows_com else [p for p in infos if p.likely_esp32s3]
+            LAST_PORT_INFO.clear()
+            LAST_PORT_INFO.update({p.device: p for p in selected})
+            return sorted(selected, key=lambda p: natural_key(p.device))
+        # Last-resort fallback only when explicitly requested; otherwise avoid
+        # showing COM1..COM256 and confusing beginners.
+        fallback = [PortInfo(device=f"COM{i}", description="未识别的 COM 端口", likely_esp32s3=False) for i in range(1, 257)] if include_all_windows_com else []
+        LAST_PORT_INFO.clear()
+        LAST_PORT_INFO.update({p.device: p for p in fallback})
+        return fallback
+
+    candidates: list[str] = []
     if system == "darwin":
         patterns = (
             "/dev/cu.usbmodem*",
@@ -111,7 +227,14 @@ def discover_ports() -> list[str]:
         patterns = ("/dev/serial/by-id/*", "/dev/ttyACM*", "/dev/ttyUSB*")
     for pattern in patterns:
         candidates.extend(glob.glob(pattern))
-    return dedupe_ports([p for p in candidates if os.path.exists(p)])
+    ports = dedupe_ports([p for p in candidates if os.path.exists(p)])
+    LAST_PORT_INFO.clear()
+    LAST_PORT_INFO.update({p: _score_port_info(p, os.path.basename(p), os.path.realpath(p), None, None) for p in ports})
+    return [LAST_PORT_INFO[p] for p in ports]
+
+
+def discover_ports(include_all_windows_com: bool = False) -> list[str]:
+    return [p.device for p in discover_port_infos(include_all_windows_com=include_all_windows_com)]
 
 
 def venv_python(venv: Path) -> Path:
@@ -318,6 +441,7 @@ class App(tk.Tk):
         self.address_var = tk.StringVar(value="0x0")
         self.erase_var = tk.BooleanVar(value=False)
         self.select_all_var = tk.BooleanVar(value=True)
+        self.show_all_ports_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="准备好了喵～请选择固件并刷新端口")
         self.port_vars: dict[str, tk.BooleanVar] = {}
         self.ports: list[str] = []
@@ -416,6 +540,14 @@ class App(tk.Tk):
             command=self.toggle_all_ports,
             style="Cute.TCheckbutton",
         ).pack(side="left", padx=12)
+        if platform.system().lower() == "windows":
+            ttk.Checkbutton(
+                port_bar,
+                text="显示全部 COM",
+                variable=self.show_all_ports_var,
+                command=self.refresh_ports,
+                style="Cute.TCheckbutton",
+            ).pack(side="left", padx=(0, 8))
 
         self.port_canvas = tk.Canvas(wrap, bg=WHITE, bd=0, highlightthickness=0)
         scrollbar = ttk.Scrollbar(wrap, orient="vertical", command=self.port_canvas.yview)
@@ -485,30 +617,44 @@ class App(tk.Tk):
     def refresh_ports(self) -> None:
         if self.busy:
             return
-        self.ports = discover_ports()
+        self.ports = discover_ports(include_all_windows_com=self.show_all_ports_var.get())
         for child in self.port_frame.winfo_children():
             child.destroy()
         self.port_vars.clear()
         if not self.ports:
+            if platform.system().lower() == "windows":
+                text = "没有自动识别到 ESP32-S3。请插入设备，必要时按住 BOOT 再点 RESET。\n\n如果你确认设备已经插上，可以勾选上方“显示全部 COM”手动选择。"
+            else:
+                text = "没有发现端口。请插入 ESP32-S3，必要时按住 BOOT 再点 RESET。"
             tk.Label(
                 self.port_frame,
-                text="没有发现端口。请插入 ESP32-S3，必要时按住 BOOT 再点 RESET。",
+                text=text,
                 bg=WHITE,
                 fg=MUTED,
                 justify="left",
                 wraplength=360,
             ).pack(anchor="w", pady=10)
-            self.status_var.set("未发现设备喵～")
+            self.status_var.set("未发现 ESP32-S3 设备喵～")
+            self.log("刷新端口：没有自动识别到 ESP32-S3", "cute")
             return
         for p in self.ports:
             var = tk.BooleanVar(value=True)
             self.port_vars[p] = var
+            info = LAST_PORT_INFO.get(p)
             real = os.path.realpath(p)
-            label = p if real == p else f"{p}\n  → {real}"
+            if info and info.description:
+                label = f"{p}  ·  {info.description}"
+                if info.reason:
+                    label += f"\n  ✓ 疑似 ESP32-S3：{info.reason}"
+            else:
+                label = p if real == p else f"{p}\n  → {real}"
+            if real != p and not (info and info.description):
+                label = f"{label}\n  → {real}"
             cb = ttk.Checkbutton(self.port_frame, text=label, variable=var, style="Cute.TCheckbutton")
             cb.pack(anchor="w", fill="x", pady=5)
-        self.status_var.set(f"发现 {len(self.ports)} 个端口，默认已全选 ✨")
-        self.log(f"刷新端口：发现 {len(self.ports)} 个设备", "cute")
+        kind = "全部 COM 端口" if self.show_all_ports_var.get() and platform.system().lower() == "windows" else "疑似 ESP32-S3 设备"
+        self.status_var.set(f"发现 {len(self.ports)} 个{kind}，默认已全选 ✨")
+        self.log(f"刷新端口：发现 {len(self.ports)} 个{kind}", "cute")
 
     def toggle_all_ports(self) -> None:
         value = self.select_all_var.get()
@@ -635,6 +781,7 @@ def main() -> int:
         rc, out = run_embedded_esptool(["version"])
         print(f"embedded_esptool_rc={rc}")
         print(out.strip())
+        print("ports=" + ",".join(discover_ports()))
         return rc
 
     try:

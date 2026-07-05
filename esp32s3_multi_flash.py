@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as futures
+from dataclasses import dataclass
 import glob
 import hashlib
 import os
@@ -25,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import platform
 import time
 from typing import Iterable
 
@@ -74,13 +76,118 @@ def dedupe_ports(paths: Iterable[str]) -> list[str]:
     return sorted(best_by_real.values())
 
 
-def discover_ports() -> list[str]:
+@dataclass(frozen=True)
+class PortInfo:
+    device: str
+    description: str = ""
+    hwid: str = ""
+    vid: int | None = None
+    pid: int | None = None
+    likely_esp32s3: bool = False
+    reason: str = ""
+
+
+ESPRESSIF_VIDS = {0x303A}
+COMMON_ESP_USB_SERIAL_VIDS = {0x10C4, 0x1A86, 0x0403, 0x2E8A}
+ESP_TEXT_HINTS = ("esp32", "esp32-s3", "esp32s3", "espressif", "usb jtag/serial", "usb-jtag", "cp210", "silicon labs", "ch340", "wch", "ft232", "ftdi")
+LAST_PORT_INFO: dict[str, PortInfo] = {}
+
+
+def _score_port_info(device: str, description: str = "", hwid: str = "", vid: int | None = None, pid: int | None = None) -> PortInfo:
+    text = f"{device} {description} {hwid}".lower()
+    likely = False
+    reasons: list[str] = []
+    if vid in ESPRESSIF_VIDS:
+        likely = True
+        reasons.append("Espressif USB")
+    elif vid in COMMON_ESP_USB_SERIAL_VIDS:
+        likely = True
+        reasons.append("常见 ESP32 USB-Serial 芯片")
+    for hint in ESP_TEXT_HINTS:
+        if hint in text:
+            likely = True
+            reasons.append(hint)
+            break
+    return PortInfo(device=device, description=description, hwid=hwid, vid=vid, pid=pid, likely_esp32s3=likely, reason=" / ".join(dict.fromkeys(reasons)))
+
+
+def _pyserial_port_infos() -> list[PortInfo]:
+    try:
+        from serial.tools import list_ports  # type: ignore
+    except Exception:
+        return []
+    out: list[PortInfo] = []
+    for item in list_ports.comports():
+        out.append(_score_port_info(
+            getattr(item, "device", "") or "",
+            getattr(item, "description", "") or "",
+            getattr(item, "hwid", "") or "",
+            getattr(item, "vid", None),
+            getattr(item, "pid", None),
+        ))
+    return [p for p in out if p.device]
+
+
+def _windows_wmi_port_infos() -> list[PortInfo]:
+    if platform.system().lower() != "windows":
+        return []
+    try:
+        cmd = [
+            "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+            "Get-CimInstance Win32_PnPEntity | Where-Object { $_.Name -match '\(COM[0-9]+\)' } | ForEach-Object { $_.Name + '|' + $_.PNPDeviceID }",
+        ]
+        r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=6)
+    except Exception:
+        return []
+    if r.returncode != 0:
+        return []
+    import re
+    out: list[PortInfo] = []
+    for line in r.stdout.splitlines():
+        if "|" not in line:
+            continue
+        name, hwid = line.split("|", 1)
+        m = re.search(r"\((COM\d+)\)", name, re.I)
+        if not m:
+            continue
+        vid = pid = None
+        vm = re.search(r"VID_([0-9A-F]{4})", hwid, re.I)
+        pm = re.search(r"PID_([0-9A-F]{4})", hwid, re.I)
+        if vm:
+            vid = int(vm.group(1), 16)
+        if pm:
+            pid = int(pm.group(1), 16)
+        out.append(_score_port_info(m.group(1).upper(), name, hwid, vid, pid))
+    return out
+
+
+def discover_port_infos(include_all_windows_com: bool = False) -> list[PortInfo]:
+    system = platform.system().lower()
+    if system == "windows":
+        infos = _pyserial_port_infos() or _windows_wmi_port_infos()
+        if infos:
+            selected = infos if include_all_windows_com else [p for p in infos if p.likely_esp32s3]
+            LAST_PORT_INFO.clear()
+            LAST_PORT_INFO.update({p.device: p for p in selected})
+            return sorted(selected, key=lambda p: p.device)
+        fallback = [PortInfo(device=f"COM{i}", description="未识别的 COM 端口") for i in range(1, 257)] if include_all_windows_com else []
+        LAST_PORT_INFO.clear()
+        LAST_PORT_INFO.update({p.device: p for p in fallback})
+        return fallback
+
     candidates: list[str] = []
     # by-id 放前面，避免 /dev/ttyACM0 这种热插拔变化名字优先。
     for pattern in ("/dev/serial/by-id/*", "/dev/ttyACM*", "/dev/ttyUSB*"):
         candidates.extend(glob.glob(pattern))
     candidates = [p for p in candidates if os.path.exists(p)]
-    return dedupe_ports(candidates)
+    ports = dedupe_ports(candidates)
+    LAST_PORT_INFO.clear()
+    LAST_PORT_INFO.update({p: _score_port_info(p, os.path.basename(p), os.path.realpath(p)) for p in ports})
+    return [LAST_PORT_INFO[p] for p in ports]
+
+
+def discover_ports(include_all_windows_com: bool = False) -> list[str]:
+    return [p.device for p in discover_port_infos(include_all_windows_com=include_all_windows_com)]
 
 
 def venv_python(venv: Path) -> Path:
@@ -258,9 +365,14 @@ def print_ports(ports: list[str]) -> None:
         return
     print("发现端口：")
     for i, p in enumerate(ports, 1):
+        info = LAST_PORT_INFO.get(p)
         real = os.path.realpath(p)
         suffix = f" -> {real}" if real != p else ""
-        print(f"  {i}. {p}{suffix}")
+        if info and info.description:
+            reason = f" [{info.reason}]" if info.reason else ""
+            print(f"  {i}. {p} - {info.description}{reason}")
+        else:
+            print(f"  {i}. {p}{suffix}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -283,7 +395,8 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument("firmware", type=Path, help="要烧录的合并固件 .bin 文件")
-    p.add_argument("--ports", help="逗号分隔端口列表；不填则自动发现所有 ttyACM/ttyUSB/by-id")
+    p.add_argument("--ports", help="逗号分隔端口列表；不填则自动发现 ESP32-S3/常见 USB 串口设备")
+    p.add_argument("--all-com", action="store_true", help="Windows 上显示全部 COM 口（默认只显示疑似 ESP32-S3）")
     p.add_argument("--list", action="store_true", help="只列出将使用的端口，不烧录")
     p.add_argument("--dry-run", action="store_true", help="只打印将执行的 esptool 命令，不烧录")
     p.add_argument("--baud", type=int, default=460800, help="烧录波特率，默认 460800")
@@ -306,7 +419,7 @@ def main() -> int:
     if firmware.suffix.lower() != ".bin":
         eprint(f"警告：文件后缀不是 .bin：{firmware}")
 
-    ports = split_ports(args.ports) or discover_ports()
+    ports = split_ports(args.ports) or discover_ports(include_all_windows_com=args.all_com)
     ports = dedupe_ports(ports)
 
     print(f"固件：{firmware}")

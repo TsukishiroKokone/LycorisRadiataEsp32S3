@@ -1,6 +1,6 @@
 # LycorisRadiata ESP32-S3 Flasher
 
-白粉色、小白友好的 ESP32-S3 图形化固件烧录工具。支持选择 `.bin` 固件、自动发现串口、勾选多个设备并行烧录，适合把同一个固件批量写入多个 ESP32-S3。
+白粉色、小白友好的 ESP32-S3 图形化固件烧录工具。支持选择 `.bin` 固件、自动发现并筛选疑似 ESP32-S3 的串口、勾选多个设备并行烧录，适合把同一个固件批量写入多个 ESP32-S3。
 
 ## 下载三平台可执行文件
 
@@ -36,6 +36,17 @@
 - `build_standalone_windows.bat`：Windows PyInstaller 构建脚本。
 - `.github/workflows/build-flasher.yml`：GitHub Actions 三平台构建工作流。
 - `GUI_FLASHER_README.md`：更详细的小白使用说明。
+
+## Windows 端口自动识别
+
+Windows 下程序不会默认显示全部 `COM1..COM256`。它会先读取串口 USB 描述、硬件 ID、VID/PID，只显示疑似 ESP32-S3 的设备，例如：
+
+- Espressif 原生 USB/JTAG Serial，VID `303A`
+- CP210x，VID `10C4`
+- CH340/CH910x，VID `1A86`
+- FTDI，VID `0403`
+
+如果确实识别不到，但你确认设备已经插上，可以勾选界面里的“显示全部 COM”再手动选择。
 
 ## 本地构建
 

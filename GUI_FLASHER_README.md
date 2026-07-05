@@ -152,8 +152,11 @@ Linux 常见端口名：
 1. 安装 Python 3。
 2. 双击 `launch_flasher_gui_windows.bat`。
 3. 选择 `.bin` 固件。
-4. 勾选 COM 端口。
-5. 点击一键烧录。
+4. 点击“刷新端口”，程序会优先只显示疑似 ESP32-S3 的 COM 端口。
+5. 勾选要烧录的 COM 端口。
+6. 点击一键烧录。
+
+Windows 自动识别依据包括 Espressif 原生 USB/JTAG Serial、CP210x、CH340/CH910x、FTDI 等常见 ESP32-S3 开发板 USB 串口芯片。这样不会一打开就显示全部 `COM1..COM256`。如果没有识别到但你确认设备已插入，可以勾选“显示全部 COM”手动选择。
 
 ## 常见问题
 
