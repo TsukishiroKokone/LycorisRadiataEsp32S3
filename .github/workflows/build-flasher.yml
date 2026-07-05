@@ -1,0 +1,90 @@
+name: Build LycorisRadiata Flasher
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x64
+            artifact: LycorisRadiata-Flasher-linux-x64
+          - os: windows-latest
+            name: windows-x64
+            artifact: LycorisRadiata-Flasher-windows-x64
+          - os: macos-latest
+            name: macos-arm64
+            artifact: LycorisRadiata-Flasher-macos-arm64
+          - os: macos-13
+            name: macos-intel
+            artifact: LycorisRadiata-Flasher-macos-intel
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build Linux/macOS
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          chmod +x build_standalone.sh
+          ./build_standalone.sh
+
+      - name: Build Windows
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: build_standalone_windows.bat
+
+      - name: Prepare artifact Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p artifact
+          cp dist/LycorisRadiata-Flasher artifact/LycorisRadiata-Flasher-linux-x64
+          cp GUI_FLASHER_README.md artifact/
+          cp -R firmware artifact/
+
+      - name: Prepare artifact macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p artifact
+          if [ -f dist/LycorisRadiata-Flasher-macOS.zip ]; then
+            cp dist/LycorisRadiata-Flasher-macOS.zip artifact/${{ matrix.artifact }}.zip
+          elif [ -d dist/LycorisRadiata-Flasher.app ]; then
+            (cd dist && zip -qry ../artifact/${{ matrix.artifact }}.zip LycorisRadiata-Flasher.app)
+          else
+            cp dist/LycorisRadiata-Flasher artifact/${{ matrix.artifact }}
+          fi
+          cp GUI_FLASHER_README.md artifact/
+          cp -R firmware artifact/
+
+      - name: Prepare artifact Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifact | Out-Null
+          Copy-Item dist/LycorisRadiata-Flasher.exe artifact/LycorisRadiata-Flasher-windows-x64.exe
+          Copy-Item GUI_FLASHER_README.md artifact/
+          Copy-Item -Recurse firmware artifact/firmware
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: artifact/*

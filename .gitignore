@@ -1,0 +1,25 @@
+# Python / build caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.spec
+
+# Virtual environments / local toolchains
+.venv/
+.flash-venv/
+.esp32s3-flash-venv/
+.winbuild/
+
+# PyInstaller outputs
+build/
+dist/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# Logs
+*.log
